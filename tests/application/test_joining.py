@@ -184,6 +184,10 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
     await app.shutdown()
 
 
+@mock.patch(
+    "zigpy.device.Device._initialize",
+    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
+)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
@@ -204,6 +208,10 @@ async def test_on_zdo_device_join(device, make_application, mocker):
     await app.shutdown()
 
 
+@mock.patch(
+    "zigpy.device.Device._initialize",
+    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
+)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join_and_announce_fast(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
@@ -258,7 +266,11 @@ async def test_on_zdo_device_join_and_announce_fast(device, make_application, mo
     # Everything is cleaned up
     assert not app._join_announce_tasks
 
+    app.get_device(ieee=ieee).cancel_initialization()
     await app.shutdown()
+
+    with pytest.raises(asyncio.CancelledError):
+        await app.get_device(ieee=ieee)._initialize_task
 
 
 @mock.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0.1)
@@ -329,3 +341,6 @@ async def test_on_zdo_device_join_and_announce_slow(device, make_application, mo
 
     app.get_device(ieee=ieee).cancel_initialization()
     await app.shutdown()
+
+    with pytest.raises(asyncio.CancelledError):
+        await app.get_device(ieee=ieee)._initialize_task
