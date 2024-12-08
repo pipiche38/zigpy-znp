@@ -474,7 +474,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 cluster_id=packet.cluster_id, data=packet.data.serialize()
             )
         except Exception:
-            LOGGER.warning( f"Failed to deserialize ZDO packet {packet}", exc_info=True)
+            LOGGER.warning(f"Failed to deserialize ZDO packet {packet}", exc_info=True)
         else:
             if zdo_hdr.command_id == zdo_t.ZDOCmd.Device_annce:
                 _, ieee, _ = zdo_args
