@@ -2,22 +2,22 @@ import pytest
 import voluptuous as vol
 from zigpy.exceptions import NetworkNotFormed
 
-import zigpy_znp.types as t
-import zigpy_znp.config as conf
-import zigpy_znp.commands as c
 from zigpy_znp.api import ZNP
+import zigpy_znp.commands as c
+import zigpy_znp.config as conf
 from zigpy_znp.exceptions import InvalidCommandResponse
+import zigpy_znp.types as t
 from zigpy_znp.types.nvids import ExNvIds, OsalNvIds
 
 from ..conftest import (
     ALL_DEVICES,
     EMPTY_DEVICES,
     FORMED_DEVICES,
-    CoroutineMock,
     BaseZStack3Device,
+    CoroutineMock,
+    FormedLaunchpadCC26X2R1,
     FormedZStack1CC2531,
     FormedZStack3CC2531,
-    FormedLaunchpadCC26X2R1,
 )
 
 DEV_NETWORK_SETTINGS = {
@@ -103,10 +103,11 @@ async def test_endpoints(device, make_application):
 
     await app.startup(auto_form=False)
 
-    # We currently just register two endpoints
-    assert len(endpoints) == 2
+    # We register the two application endpoints and zigpy's Green Power endpoint
+    assert len(endpoints) == 3
     assert 1 in app._device.endpoints
     assert 2 in app._device.endpoints
+    assert 242 in app._device.endpoints
 
     await app.shutdown()
 
@@ -313,3 +314,42 @@ async def test_concurrency_auto_config(device, concurrency, make_application):
     await app.start_network()
 
     assert app._concurrent_requests_semaphore.max_concurrency == concurrency
+
+
+@pytest.mark.parametrize(
+    ("code_revision", "expected"),
+    [
+        (None, False),
+        (20190608, False),
+        (20221226, False),
+        (20230506, False),
+        (20230507, True),
+        (20250321, True),
+    ],
+)
+async def test_child_aging_by_build(code_revision, expected, make_application):
+    app, znp_server = make_application(FormedLaunchpadCC26X2R1)
+
+    znp_server.reply_to(
+        c.SYS.Version.Req(),
+        responses=c.SYS.Version.Rsp(
+            TransportRev=2,
+            ProductId=1,
+            MajorRel=2,
+            MinorRel=7,
+            MaintRel=1,
+            CodeRevision=code_revision,
+            BootloaderBuildType=None,
+            BootloaderRevision=None,
+        ),
+        override=True,
+    )
+
+    await app.startup(auto_form=False)
+
+    value = await app._znp.nvram.osal_read(
+        OsalNvIds.NWK_CHILD_AGE_ENABLE, item_type=t.Bool
+    )
+    assert value == expected
+
+    await app.shutdown()

@@ -1,30 +1,30 @@
 from __future__ import annotations
 
-import os
 import asyncio
 import logging
+import os
 
-import zigpy.zcl
-import zigpy.zdo
-import zigpy.util
+import zigpy.application
+import zigpy.config
+import zigpy.config.defaults
+import zigpy.device
+from zigpy.exceptions import DeliveryError
+import zigpy.profiles
 import zigpy.state
 import zigpy.types
-import zigpy.config
-import zigpy.device
-import zigpy.profiles
+import zigpy.util
+import zigpy.zcl
+import zigpy.zdo
 import zigpy.zdo.types as zdo_t
-import zigpy.application
-import zigpy.config.defaults
-from zigpy.exceptions import DeliveryError
 
-import zigpy_znp.const as const
-import zigpy_znp.types as t
-import zigpy_znp.config as conf
-import zigpy_znp.commands as c
 from zigpy_znp.api import ZNP
-from zigpy_znp.utils import combine_concurrent_calls
+import zigpy_znp.commands as c
+import zigpy_znp.config as conf
+import zigpy_znp.const as const
 from zigpy_znp.exceptions import CommandNotRecognized, InvalidCommandResponse
+import zigpy_znp.types as t
 from zigpy_znp.types.nvids import OsalNvIds
+from zigpy_znp.utils import combine_concurrent_calls
 from zigpy_znp.zigbee.device import ZNPCoordinator
 
 ZDO_ENDPOINT = 0
@@ -36,6 +36,8 @@ STARTUP_TIMEOUT = 5
 DATA_CONFIRM_TIMEOUT = 8
 EXTENDED_DATA_CONFIRM_TIMEOUT = 30
 DEVICE_JOIN_MAX_DELAY = 5
+# First Koenkk Z-Stack 3.x.0 build with child aging enabled (and Xiaomi exempted)
+CHILD_AGING_MIN_BUILD_ID = 20230507
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +141,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if self.state.node_info == zigpy.state.NodeInfo():
             await self.load_network_info()
 
+        # Needed by the stack settings below
+        self._version_rsp = await self._znp.request(c.SYS.Version.Req())
+
         if not read_only:
             await self._znp.migrate_nvram()
             await self._write_stack_settings()
@@ -149,8 +154,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             await self.set_tx_power(dbm=self.znp_config[conf.CONF_TX_POWER])
 
         await self._znp.start_network()
-
-        self._version_rsp = await self._znp.request(c.SYS.Version.Req())
 
         # The CC2531 running Z-Stack Home 1.2 overrides the LED setting if it is changed
         # before the coordinator has started.
@@ -607,7 +610,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     c.UTIL.LEDControl.Req(LED=led, Mode=mode),
                     RspStatus=t.Status.SUCCESS,
                 )
-        except (asyncio.TimeoutError, CommandNotRecognized):
+        except (TimeoutError, CommandNotRecognized):
             LOGGER.info("This build of Z-Stack does not appear to support LED control")
 
     async def _write_stack_settings(self) -> bool:
@@ -624,7 +627,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             OsalNvIds.CONCENTRATOR_DISCOVERY: t.uint8_t(120),
             OsalNvIds.CONCENTRATOR_RC: t.Bool(True),
             OsalNvIds.SRC_RTG_EXPIRY_TIME: t.uint8_t(255),
-            OsalNvIds.NWK_CHILD_AGE_ENABLE: t.Bool(False),
+            # Koenkk's builds enable child aging from 20230507 on and skip the leave
+            # for Xiaomi devices, which do not implement it. Older builds have no such
+            # exception, so aging stays off there. The value is written either way
+            # because an earlier zigpy-znp may have left `False` in NVRAM.
+            OsalNvIds.NWK_CHILD_AGE_ENABLE: t.Bool(
+                self._zstack_build_id >= CHILD_AGING_MIN_BUILD_ID
+            ),
             # Default is 20 in Z-Stack 3.0.1, 30 in Z-Stack 3/4
             OsalNvIds.BCAST_DELIVERY_TIME: t.uint8_t(30),
             # We want to receive all ZDO callbacks to proxy them back to zigpy
@@ -779,8 +788,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             ) or (
                 # Or a direct unicast request
-                dst_addr.mode == t.AddrMode.NWK
-                and dst_addr.address == self._device.nwk
+                dst_addr.mode == t.AddrMode.NWK and dst_addr.address == self._device.nwk
             ):
                 self.packet_received(
                     zigpy.types.ZigbeePacket(
@@ -887,12 +895,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         succeeded = False
         child_association = None
         tried_assoc_remove = False
+        last_error = None
 
         try:
             # We retry sending twice but the only devices that will use the second retry
             # attempt are sleeping end devices that silently switched parents from the
-            # coordinator, all others will fail immediately
-            for _retry_attempt in range(2):
+            # coordinator, as well as devices for which we just rediscovered a route.
+            # All others will fail immediately.
+            for retry_attempt in range(2):
                 async with self._limit_concurrency(priority=packet.priority):
                     try:
                         # ZDO requests do not generate `AF.DataConfirm` messages
@@ -933,10 +943,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                         succeeded = True
                         break
                     except InvalidCommandResponse as e:
-                        # Child aging is disabled so if a child switches parents from
-                        # the coordinator to another router, we will not be able to
-                        # re-discover a route to it. We have to manually drop the child
-                        # to do this.
+                        last_error = e
+
+                        # Child aging is off on older builds, so if a child switches
+                        # parents from the coordinator to another router, we will not be
+                        # able to re-discover a route to it. We have to manually drop
+                        # the child to do this.
                         if (
                             e.response.Status == t.Status.MAC_TRANSACTION_EXPIRED
                             and device is not None
@@ -973,14 +985,29 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                             else:
                                 continue
 
-                        # Perform route discovery explicitly if the stack fails
-                        if e.response.Status == t.Status.NWK_NO_ROUTE:
+                        # Perform route discovery explicitly if the stack fails and
+                        # then retry the request
+                        if (
+                            e.response.Status == t.Status.NWK_NO_ROUTE
+                            and device is not None
+                            and retry_attempt < 1
+                        ):
                             await self._discover_route(device.nwk)
+                            continue
 
                         raise
+            else:
+                # Every attempt was consumed by a recovery `continue` without a
+                # successful send (e.g. NWK_NO_ROUTE followed by a first-time
+                # MAC_TRANSACTION_EXPIRED on the final attempt). Surface the last
+                # error instead of silently reporting the send as successful.
+                if last_error is not None:
+                    raise last_error
         except InvalidCommandResponse as e:
             status = e.response.Status
-            raise DeliveryError(f"Failed to send request: {status!r}", status=status)
+            raise DeliveryError(
+                f"Failed to send request: {status!r}", status=status
+            ) from e
         finally:
             # We *must* re-add the device association if we previously removed it but
             # the request still failed. Otherwise, it may be a direct child and we will

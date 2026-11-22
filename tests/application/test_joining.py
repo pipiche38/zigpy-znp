@@ -3,21 +3,20 @@ import contextlib
 from unittest import mock
 
 import pytest
-import zigpy.util
 import zigpy.types
-import zigpy.device
+import zigpy.util
 import zigpy.zdo.types as zdo_t
 
-import zigpy_znp.types as t
 import zigpy_znp.commands as c
+import zigpy_znp.types as t
 
 from ..conftest import (
     FORMED_DEVICES,
     FORMED_ZSTACK3_DEVICES,
     CoroutineMock,
     FormedLaunchpadCC26X2R1,
-    zdo_request_matcher,
     serialize_zdo_command,
+    zdo_request_matcher,
 )
 
 
@@ -40,7 +39,7 @@ async def test_permit_join(device, mocker, make_application):
         request=zdo_request_matcher(
             dst_addr=t.AddrModeAddress(t.AddrMode.Broadcast, 0xFFFC),
             command_id=zdo_t.ZDOCmd.Mgmt_Permit_Joining_req,
-            TSN=2,
+            TSN=4,  # zigpy sends a Green Power commissioning broadcast first (TSN 3)
             zdo_PermitDuration=10,
             zdo_TC_Significant=0,
         ),
@@ -133,7 +132,7 @@ async def test_join_device(device, make_application):
 
 
 @pytest.mark.parametrize("device", FORMED_ZSTACK3_DEVICES)
-@pytest.mark.parametrize("permit_result", [None, asyncio.TimeoutError()])
+@pytest.mark.parametrize("permit_result", [None, TimeoutError()])
 async def test_permit_join_with_key(device, permit_result, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
 
@@ -169,8 +168,10 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
 
     mocker.patch.object(app, "permit", new=CoroutineMock(side_effect=permit_result))
 
-    with contextlib.nullcontext() if permit_result is None else pytest.raises(
-        asyncio.TimeoutError
+    with (
+        contextlib.nullcontext()
+        if permit_result is None
+        else pytest.raises(asyncio.TimeoutError)
     ):
         await app.permit_with_link_key(node=ieee, link_key=link_key, time_s=1)
 
@@ -184,10 +185,6 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
     await app.shutdown()
 
 
-@mock.patch(
-    "zigpy.device.Device._initialize",
-    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
-)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
@@ -210,10 +207,6 @@ async def test_on_zdo_device_join(device, make_application, mocker):
     await app.shutdown()
 
 
-@mock.patch(
-    "zigpy.device.Device._initialize",
-    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
-)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join_and_announce_fast(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
@@ -273,10 +266,6 @@ async def test_on_zdo_device_join_and_announce_fast(device, make_application, mo
 
 
 @mock.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0.1)
-@mock.patch(
-    "zigpy.device.Device._initialize",
-    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
-)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join_and_announce_slow(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
